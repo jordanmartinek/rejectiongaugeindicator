@@ -44,8 +44,24 @@ The factors are combined using **editable weights** (auto-normalized) into a
 
 - **Manual:** enter a price in the inputs.
 - **Auto:** nearest confirmed swing-high (resistance) / swing-low (support) pivot.
-- The **active level** is whichever valid level price is currently closest to,
-  and the gauge only activates when price is within `proximity × ATR(14)` of it.
+- The **active level** is whichever valid level price is currently closest to.
+
+### Engagement latch (stays alive through the resolution)
+
+The gauge uses an **engagement latch** so it doesn't blink to N/A the moment a
+candle pushes past the level — essential on 5m and higher timeframes:
+
+1. **Touch is range-based.** A level engages when the candle's **range** (wick
+   included) reaches within `Engage proximity × ATR(14)` — not just the close.
+2. **Hold period.** Once engaged, the gauge **latches** onto that level and keeps
+   scoring it for at least `Hold bars after engage` bars, even if price trades
+   beyond the level, so you can read the full rejection/break-and-retest.
+3. **Release.** The level is released only after the hold period has elapsed
+   **and** price has moved beyond `Release distance × ATR` from it (or a new,
+   nearer level supersedes it).
+
+Set `Hold bars after engage = 0` to restore the old behavior (drop immediately
+when price closes outside the proximity band).
 
 ## Direction modes
 

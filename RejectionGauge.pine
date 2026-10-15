@@ -32,7 +32,9 @@ pivotLen  = input.int(5, "Pivot lookback/forward", minval=1, maxval=50, group=gr
 
 grpScore  = "Scoring"
 window    = input.int(5, "Approach window (candles)", minval=2, maxval=30, group=grpScore, tooltip="How many candles leading into the level feed the score.")
-proximity = input.float(0.5, "Proximity to level (ATR mult)", minval=0.05, step=0.05, group=grpScore, tooltip="Price must be within this many ATRs of a level for the gauge to activate.")
+proximity = input.float(0.5, "Engage proximity (ATR mult)", minval=0.05, step=0.05, group=grpScore, tooltip="Price must come within this many ATRs of a level (wick counts) to ENGAGE the gauge.")
+holdBars  = input.int(8, "Hold bars after engage", minval=0, maxval=100, group=grpScore, tooltip="Once engaged, keep reading the level for at least this many bars even if price pushes beyond it. 0 = legacy behavior (drop immediately when out of range).")
+releaseMlt = input.float(1.5, "Release distance (ATR mult)", minval=0.1, step=0.1, group=grpScore, tooltip="The gauge only releases a level after price moves at least this many ATRs away from it (and the hold period has elapsed).")
 
 grpW      = "Factor Weights (sum is auto-normalized)"
 wBody     = input.float(1.0, "Body / range ratio",        minval=0.0, step=0.1, group=grpW)
@@ -116,8 +118,56 @@ else if not na(distSup)
     activeLvl := lvlSup
     activeDir := -1
 
-// Only activate when price is within proximity (in ATRs) of the level.
-inRange = not na(activeLvl) and math.abs(close - activeLvl) <= proximity * atr
+// ----------------------------------------------------------------------------
+//  ENGAGEMENT LATCH
+//  Problem solved: previously the gauge went idle the instant price closed
+//  beyond the level, so on 5m+ it reverted to N/A before you could read the
+//  resolution. Now:
+//    1. "Touch" is based on the candle RANGE reaching the proximity band
+//       (a wick counts), not just the close.
+//    2. Once engaged, we LATCH onto that level and keep scoring it for at
+//       least `holdBars`, and only RELEASE after price has moved beyond
+//       `releaseMlt * ATR` AND the hold period has elapsed (or a new, nearer
+//       level supersedes it).
+// ----------------------------------------------------------------------------
+engBand   = proximity * atr
+releaseBand = releaseMlt * atr
+
+// Did this bar's RANGE reach the proximity band of the active candidate?
+touchNow = not na(activeLvl) and (high >= activeLvl - engBand) and (low <= activeLvl + engBand)
+
+var float engLvl   = na     // the latched level
+var int   engDir   = 0      // latched direction
+var int   engAge   = 0      // bars since (re)engagement
+
+// (Re)engage when a fresh candidate is touched.
+reengage = touchNow and (na(engLvl) or activeLvl != engLvl)
+if reengage
+    engLvl := activeLvl
+    engDir := activeDir
+    engAge := 0
+else if touchNow
+    // still interacting with the same level -> refresh age
+    engAge := 0
+else if not na(engLvl)
+    engAge += 1
+
+// Release condition: held long enough AND price has clearly walked away.
+// distance of the whole bar from the level (0 if bar straddles it)
+straddles = not na(engLvl) and high >= engLvl and low <= engLvl
+barDist = straddles ? 0.0 : (na(engLvl) ? na : math.min(math.abs(high - engLvl), math.abs(low - engLvl)))
+
+if not na(engLvl) and holdBars > 0 and engAge > holdBars and not na(barDist) and barDist > releaseBand
+    engLvl := na
+    engDir := 0
+    engAge := 0
+
+// Legacy mode: holdBars == 0 behaves like the old close-based proximity gate.
+legacyInRange = not na(activeLvl) and math.abs(close - activeLvl) <= engBand
+
+inRange   = holdBars > 0 ? not na(engLvl) : legacyInRange
+activeLvl := holdBars > 0 and not na(engLvl) ? engLvl : activeLvl
+activeDir := holdBars > 0 and not na(engLvl) ? engDir : activeDir
 
 // ----------------------------------------------------------------------------
 //  SCORING  (each factor returns 0..1 where 1 = MORE likely to REJECT)
