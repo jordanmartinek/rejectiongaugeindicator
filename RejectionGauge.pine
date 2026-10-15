@@ -1,0 +1,260 @@
+//@version=5
+// ============================================================================
+//  Rejection Probability Gauge
+//  ---------------------------------------------------------------------------
+//  Intraday scalping indicator that estimates the likelihood that price will
+//  REJECT off a key level versus PUSH THROUGH it, by reading the character of
+//  the approach candles leading into the level.
+//
+//  Core idea:
+//    - Strong solid bodies pushing into a level  -> conviction -> breakthrough
+//    - Lower-wick dominance ("buoy")             -> support building -> breakthrough
+//    - Upper-wick dominance / stalling bodies     -> exhaustion     -> rejection
+//    - Level-touch candle closing back in range   -> rejection
+//
+//  Levels can be set manually (price input) and/or auto-detected (swing pivots).
+//  Output: 0-100 rejection-likelihood gauge, meter table, candle coloring, alerts.
+// ============================================================================
+
+indicator("Rejection Probability Gauge", shorttitle="RejGauge", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ----------------------------------------------------------------------------
+//  INPUTS
+// ----------------------------------------------------------------------------
+grpMode   = "Mode & Levels"
+dirMode   = input.string("Both", "Watch direction", options=["Resistance (from below)", "Support (from above)", "Both"], group=grpMode, tooltip="Resistance: longs pushing UP into a level. Support: shorts pushing DOWN into a level.")
+
+useManual = input.bool(true,  "Use manual level", group=grpMode, inline="man")
+manualLvl = input.float(0.0,  "Manual price",     group=grpMode, inline="man", tooltip="Set the price of the level you want to watch. 0 disables.")
+
+useAuto   = input.bool(true,  "Use auto levels (swing pivots)", group=grpMode)
+pivotLen  = input.int(5, "Pivot lookback/forward", minval=1, maxval=50, group=grpMode, tooltip="Bars on each side of a swing used to confirm a pivot.")
+
+grpScore  = "Scoring"
+window    = input.int(5, "Approach window (candles)", minval=2, maxval=30, group=grpScore, tooltip="How many candles leading into the level feed the score.")
+proximity = input.float(0.5, "Proximity to level (ATR mult)", minval=0.05, step=0.05, group=grpScore, tooltip="Price must be within this many ATRs of a level for the gauge to activate.")
+
+grpW      = "Factor Weights (sum is auto-normalized)"
+wBody     = input.float(1.0, "Body / range ratio",        minval=0.0, step=0.1, group=grpW)
+wWick     = input.float(1.0, "Wick asymmetry (buoy/exh.)", minval=0.0, step=0.1, group=grpW)
+wDir      = input.float(1.0, "Direction consistency",     minval=0.0, step=0.1, group=grpW)
+wClose    = input.float(1.0, "Close location at level",   minval=0.0, step=0.1, group=grpW)
+
+grpAlert  = "Alerts"
+alertHi   = input.int(70, "High rejection threshold", minval=50, maxval=100, group=grpAlert)
+alertLo   = input.int(30, "Low rejection (breakout) threshold", minval=0, maxval=50, group=grpAlert)
+
+grpViz    = "Visuals"
+showTable = input.bool(true,  "Show gauge meter", group=grpViz)
+colorBars = input.bool(true,  "Color approach candles", group=grpViz)
+showLines = input.bool(true,  "Draw active level line", group=grpViz)
+tblPos    = input.string("Top Right", "Meter position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grpViz)
+
+// ----------------------------------------------------------------------------
+//  HELPERS
+// ----------------------------------------------------------------------------
+atr = ta.atr(14)
+
+// Per-candle geometry (guard against zero-range candles)
+rng(i)       => math.max(high[i] - low[i], syminfo.mintick)
+bodySz(i)    => math.abs(close[i] - open[i])
+upWick(i)    => high[i] - math.max(close[i], open[i])
+dnWick(i)    => math.min(close[i], open[i]) - low[i]
+isUp(i)      => close[i] >= open[i]
+
+// ----------------------------------------------------------------------------
+//  AUTO LEVEL DETECTION (swing pivots)
+// ----------------------------------------------------------------------------
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ----------------------------------------------------------------------------
+//  SELECT THE ACTIVE LEVEL + DIRECTION
+//  dir = +1 => resistance (price pushing up into it); -1 => support
+// ----------------------------------------------------------------------------
+watchRes = dirMode == "Resistance (from below)" or dirMode == "Both"
+watchSup = dirMode == "Support (from above)"    or dirMode == "Both"
+
+// Gather candidate levels (manual + auto) and pick the nearest ABOVE (resistance)
+// and nearest BELOW (support) relative to current price.
+var float lvlRes = na
+var float lvlSup = na
+lvlRes := na
+lvlSup := na
+
+// Resistance candidates (above price)
+if watchRes
+    if useManual and manualLvl > 0 and manualLvl >= close
+        lvlRes := manualLvl
+    if useAuto and not na(lastPH) and lastPH >= close
+        lvlRes := na(lvlRes) ? lastPH : math.min(lvlRes, lastPH)
+
+// Support candidates (below price)
+if watchSup
+    if useManual and manualLvl > 0 and manualLvl <= close
+        lvlSup := manualLvl
+    if useAuto and not na(lastPL) and lastPL <= close
+        lvlSup := na(lvlSup) ? lastPL : math.max(lvlSup, lastPL)
+
+// Decide which single level is "active": whichever price is closest to.
+float activeLvl = na
+int   activeDir = 0
+distRes = na(lvlRes) ? na : math.abs(lvlRes - close)
+distSup = na(lvlSup) ? na : math.abs(close - lvlSup)
+
+if not na(distRes) and (na(distSup) or distRes <= distSup)
+    activeLvl := lvlRes
+    activeDir := 1
+else if not na(distSup)
+    activeLvl := lvlSup
+    activeDir := -1
+
+// Only activate when price is within proximity (in ATRs) of the level.
+inRange = not na(activeLvl) and math.abs(close - activeLvl) <= proximity * atr
+
+// ----------------------------------------------------------------------------
+//  SCORING  (each factor returns 0..1 where 1 = MORE likely to REJECT)
+// ----------------------------------------------------------------------------
+// Factor 1: Body/range ratio of approach candles.
+//   Big bodies pushing INTO the level = conviction = less rejection.
+//   So reject-score = 1 - avgBodyRatio.
+f_body() =>
+    float s = 0.0
+    for i = 1 to window
+        s += bodySz(i) / rng(i)
+    avg = s / window
+    1.0 - avg
+
+// Factor 2: Wick asymmetry relative to approach direction.
+//   Resistance (dir=+1): lower wicks = buoy (less rejection),
+//                        upper wicks = exhaustion (more rejection).
+//   Support   (dir=-1): mirror.
+f_wick(dir) =>
+    float up = 0.0
+    float dn = 0.0
+    float tot = 0.0
+    for i = 1 to window
+        up  += upWick(i)
+        dn  += dnWick(i)
+        tot += rng(i)
+    tot := math.max(tot, syminfo.mintick)
+    // exhaustion-side wick fraction (the side that signals rejection)
+    exh = dir == 1 ? up / tot : dn / tot
+    // normalize: wick fractions rarely exceed ~0.6, scale toward 1
+    math.min(exh / 0.5, 1.0)
+
+// Factor 3: Direction consistency.
+//   Approach candles mostly WITH the push (up into resistance) = conviction =
+//   less rejection. Mixed/against = more rejection.
+f_dir(dir) =>
+    int withPush = 0
+    for i = 1 to window
+        pushUp = isUp(i)
+        if (dir == 1 and pushUp) or (dir == -1 and not pushUp)
+            withPush += 1
+    frac = withPush / window
+    1.0 - frac
+
+// Factor 4: Close location of the level-touching candle.
+//   Resistance: wicked through top but closed back DOWN in range = rejection.
+//   Measured on the most recent candle (i=0 touch, use i=1 if 0 not formed).
+f_close(dir, lvl) =>
+    i = 0
+    touched = dir == 1 ? high[i] >= lvl : low[i] <= lvl
+    float res = 0.5
+    if touched
+        if dir == 1
+            // how far below the level did it close, relative to its range
+            res := math.min(math.max((lvl - close[i]) / rng(i), 0.0), 1.0)
+        else
+            res := math.min(math.max((close[i] - lvl) / rng(i), 0.0), 1.0)
+    res
+
+// Combine
+wSum = math.max(wBody + wWick + wDir + wClose, 0.0001)
+float score = na
+if inRange
+    s_body  = f_body()
+    s_wick  = f_wick(activeDir)
+    s_dir   = f_dir(activeDir)
+    s_close = f_close(activeDir, activeLvl)
+    score := (wBody*s_body + wWick*s_wick + wDir*s_dir + wClose*s_close) / wSum * 100.0
+
+// ----------------------------------------------------------------------------
+//  VISUALS
+// ----------------------------------------------------------------------------
+// Active level line
+var line lvlLine = na
+if showLines
+    if not na(activeLvl)
+        if na(lvlLine)
+            lvlLine := line.new(bar_index-1, activeLvl, bar_index, activeLvl, extend=extend.right, color=color.new(color.yellow, 20), width=2)
+        else
+            line.set_xy1(lvlLine, bar_index-1, activeLvl)
+            line.set_xy2(lvlLine, bar_index, activeLvl)
+            line.set_color(lvlLine, color.new(color.yellow, 20))
+    else if not na(lvlLine)
+        line.delete(lvlLine)
+        lvlLine := na
+
+// Candle coloring by rejection score when in range
+scoreColor(sc) =>
+    sc >= 66 ? color.new(color.red, 0) :
+     sc >= 33 ? color.new(color.orange, 20) :
+     color.new(color.lime, 0)
+
+barcolor(colorBars and inRange and not na(score) ? scoreColor(score) : na)
+
+// Gauge meter table
+f_tblPos() =>
+    tblPos == "Top Right"    ? position.top_right    :
+     tblPos == "Top Left"     ? position.top_left     :
+     tblPos == "Bottom Right" ? position.bottom_right :
+     position.bottom_left
+
+var table gauge = na
+if showTable and barstate.islast
+    if na(gauge)
+        gauge := table.new(f_tblPos(), 2, 6, border_width=1, frame_color=color.gray, frame_width=1)
+    scTxt   = na(score) ? "—" : str.tostring(score, "#.0")
+    scClr   = na(score) ? color.gray : scoreColor(score)
+    dirTxt  = activeDir == 1 ? "Resistance ▲" : activeDir == -1 ? "Support ▼" : "—"
+    lvlTxt  = na(activeLvl) ? "—" : str.tostring(activeLvl, format.mintick)
+    verdict = na(score) ? "Idle" : score >= alertHi ? "REJECT likely" : score <= alertLo ? "BREAK likely" : "Neutral"
+
+    table.cell(gauge, 0, 0, "Rejection Gauge", text_color=color.white, bgcolor=color.new(color.blue, 0), text_size=size.small)
+    table.cell(gauge, 1, 0, "", bgcolor=color.new(color.blue, 0))
+    table.cell(gauge, 0, 1, "Score", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 1, scTxt, text_color=color.white, bgcolor=scClr, text_size=size.normal)
+    table.cell(gauge, 0, 2, "Verdict", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 2, verdict, text_color=color.white, text_size=size.small)
+    table.cell(gauge, 0, 3, "Direction", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 3, dirTxt, text_color=color.white, text_size=size.small)
+    table.cell(gauge, 0, 4, "Level", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 4, lvlTxt, text_color=color.white, text_size=size.small)
+    table.cell(gauge, 0, 5, "In range", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 5, inRange ? "Yes" : "No", text_color=inRange ? color.lime : color.gray, text_size=size.small)
+
+// ----------------------------------------------------------------------------
+//  ALERTS
+// ----------------------------------------------------------------------------
+crossedHi = inRange and not na(score) and score >= alertHi and (na(score[1]) or score[1] < alertHi)
+crossedLo = inRange and not na(score) and score <= alertLo and (na(score[1]) or score[1] > alertLo)
+
+alertcondition(crossedHi, "High rejection likelihood", "Rejection Gauge: REJECTION likely at level")
+alertcondition(crossedLo, "Breakthrough likely",       "Rejection Gauge: BREAKTHROUGH likely at level")
+
+if crossedHi
+    alert("Rejection likely at " + str.tostring(activeLvl, format.mintick) + " (score " + str.tostring(score, "#.0") + ")", alert.freq_once_per_bar)
+if crossedLo
+    alert("Breakthrough likely at " + str.tostring(activeLvl, format.mintick) + " (score " + str.tostring(score, "#.0") + ")", alert.freq_once_per_bar)
+
+// Optional plot of the score to data window / for debugging
+plot(score, "Rejection Score", display=display.data_window)
