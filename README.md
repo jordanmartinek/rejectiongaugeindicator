@@ -42,9 +42,22 @@ The factors are combined using **editable weights** (auto-normalized) into a
 
 ## Levels
 
+Instead of reading every raw swing pivot (too noisy), the gauge watches
+**structurally meaningful levels**, each individually toggleable:
+
 - **Manual:** enter a price in the inputs.
-- **Auto:** nearest confirmed swing-high (resistance) / swing-low (support) pivot.
-- The **active level** is whichever valid level price is currently closest to.
+- **PDH / PDL:** previous day's high and low.
+- **Session highs/lows:** Asian, London, and New York (sessions are editable;
+  times are in exchange timezone). NY is off by default.
+- **FVG mitigation lines:** the 50% midpoint of fair value gaps (3-candle
+  imbalance). A gap is dropped once price trades fully through its midpoint, and
+  can optionally age out after N bars.
+- **Swing pivots (optional, OFF by default):** if you turn these on, a pivot
+  only counts when its swing leg from the prior opposite pivot is at least
+  `Min swing leg size × ATR` — filtering out insignificant swings.
+
+The **active level** is whichever enabled level price is currently closest to,
+and the meter shows its **Source** (e.g. "London High", "FVG mit (bear)").
 
 ### Engagement latch (stays alive through the resolution)
 

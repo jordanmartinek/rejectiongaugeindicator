@@ -12,7 +12,9 @@
 //    - Upper-wick dominance / stalling bodies     -> exhaustion     -> rejection
 //    - Level-touch candle closing back in range   -> rejection
 //
-//  Levels can be set manually (price input) and/or auto-detected (swing pivots).
+//  Levels: manual price, plus structural auto-levels -- PDH/PDL, session highs
+//  and lows (Asian / London / New York), and FVG mitigation (50%) lines.
+//  Optional ATR-filtered swing pivots are available but OFF by default.
 //  Output: 0-100 rejection-likelihood gauge, meter table, candle coloring, alerts.
 // ============================================================================
 
@@ -27,8 +29,23 @@ dirMode   = input.string("Both", "Watch direction", options=["Resistance (from b
 useManual = input.bool(true,  "Use manual level", group=grpMode, inline="man")
 manualLvl = input.float(0.0,  "Manual price",     group=grpMode, inline="man", tooltip="Set the price of the level you want to watch. 0 disables.")
 
-useAuto   = input.bool(true,  "Use auto levels (swing pivots)", group=grpMode)
-pivotLen  = input.int(5, "Pivot lookback/forward", minval=1, maxval=50, group=grpMode, tooltip="Bars on each side of a swing used to confirm a pivot.")
+// --- Structural auto-levels ---
+grpLvl    = "Auto Levels"
+usePDHL   = input.bool(true,  "Previous day high/low (PDH/PDL)", group=grpLvl)
+useAsia   = input.bool(true,  "Asian session high/low", group=grpLvl, inline="as")
+useLondon = input.bool(true,  "London session high/low", group=grpLvl, inline="ln")
+useNY     = input.bool(false, "New York session high/low", group=grpLvl, inline="ny")
+asiaSess  = input.session("1800-0000", "Asian session",  group=grpLvl, inline="as", tooltip="Exchange time. Default 18:00-00:00.")
+londonSess= input.session("0300-0800", "London session", group=grpLvl, inline="ln", tooltip="Exchange time. Default 03:00-08:00.")
+nySess    = input.session("0930-1600", "New York session", group=grpLvl, inline="ny", tooltip="Exchange time. Default 09:30-16:00.")
+
+useFVG    = input.bool(true,  "FVG mitigation lines (50%)", group=grpLvl)
+fvgMaxAge = input.int(50, "Max FVG age (bars, 0=unlimited)", minval=0, maxval=1000, group=grpLvl, tooltip="Ignore fair value gaps older than this many bars. 0 = keep them all.")
+
+// --- Optional pivots (OFF by default) with a significance filter ---
+usePivot    = input.bool(false, "Swing pivots (filtered)", group=grpLvl, tooltip="Raw pivots are noisy. OFF by default. When ON, only pivots whose swing leg is large enough (below) are used.")
+pivotLen    = input.int(10, "Pivot lookback/forward", minval=1, maxval=100, group=grpLvl)
+pivotMinATR = input.float(1.0, "Min swing leg size (ATR mult)", minval=0.0, step=0.1, group=grpLvl, tooltip="A pivot only counts if the move from the prior opposite pivot is at least this many ATRs. Filters out insignificant swings.")
 
 grpScore  = "Scoring"
 window    = input.int(5, "Approach window (candles)", minval=2, maxval=30, group=grpScore, tooltip="How many candles leading into the level feed the score.")
@@ -65,17 +82,99 @@ dnWick(i)    => math.min(close[i], open[i]) - low[i]
 isUp(i)      => close[i] >= open[i]
 
 // ----------------------------------------------------------------------------
-//  AUTO LEVEL DETECTION (swing pivots)
+//  STRUCTURAL LEVEL DETECTION
+//  Replaces raw swing pivots with meaningful levels: PDH/PDL, session H/L
+//  (Asian / London / New York), and FVG mitigation (50%) lines.
 // ----------------------------------------------------------------------------
+
+// ---- Previous day high / low ----
+var float pdh = na
+var float pdl = na
+isNewDay = ta.change(time("D")) != 0
+var float curDH = na
+var float curDL = na
+if isNewDay
+    pdh := curDH
+    pdl := curDL
+    curDH := high
+    curDL := low
+else
+    curDH := math.max(nz(curDH, high), high)
+    curDL := math.min(nz(curDL, low),  low)
+
+// ---- Session high/low helper via security-free in-session tracking ----
+// Returns [sessHigh, sessLow] for the CURRENT instance of a session, rolling
+// over to the previous completed session's values once the session ends.
+f_session(sessStr) =>
+    inSess   = not na(time(timeframe.period, sessStr, syminfo.timezone))
+    started  = inSess and not inSess[1]
+    var float sh = na
+    var float sl = na
+    var float prevSH = na
+    var float prevSL = na
+    if started
+        prevSH := sh
+        prevSL := sl
+        sh := high
+        sl := low
+    else if inSess
+        sh := math.max(nz(sh, high), high)
+        sl := math.min(nz(sl, low),  low)
+    // In-session: live H/L. After session ends: holds the completed session's H/L.
+    [sh, sl]
+
+[asH, asL] = f_session(asiaSess)
+[loH, loL] = f_session(londonSess)
+[nyH, nyL] = f_session(nySess)
+
+// ---- FVG mitigation (50%) lines ----
+// Bullish FVG: low[0] > high[2] -> gap between high[2] and low[0]; mitigation = midpoint.
+// Bearish FVG: high[0] < low[2] -> gap between low[2] and high[0]; mitigation = midpoint.
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+bullMit = (low + high[2]) / 2.0
+bearMit = (high + low[2]) / 2.0
+
+var float fvgUpMit  = na   // nearest unmitigated bullish-gap mid (support) below price
+var float fvgDnMit  = na   // nearest unmitigated bearish-gap mid (resistance) above price
+var int   fvgUpBar  = na
+var int   fvgDnBar  = na
+if useFVG
+    if bullFVG
+        fvgUpMit := bullMit
+        fvgUpBar := bar_index
+    if bearFVG
+        fvgDnMit := bearMit
+        fvgDnBar := bar_index
+    // invalidate once price trades fully through the mitigation
+    if not na(fvgUpMit) and close < fvgUpMit
+        fvgUpMit := na
+    if not na(fvgDnMit) and close > fvgDnMit
+        fvgDnMit := na
+    // age-out
+    if fvgMaxAge > 0
+        if not na(fvgUpBar) and bar_index - fvgUpBar > fvgMaxAge
+            fvgUpMit := na
+        if not na(fvgDnBar) and bar_index - fvgDnBar > fvgMaxAge
+            fvgDnMit := na
+
+// ---- Optional filtered swing pivots ----
 ph = ta.pivothigh(high, pivotLen, pivotLen)
 pl = ta.pivotlow(low,  pivotLen, pivotLen)
-
 var float lastPH = na
 var float lastPL = na
-if not na(ph)
-    lastPH := ph
-if not na(pl)
-    lastPL := pl
+var float sigPH  = na
+var float sigPL  = na
+if usePivot
+    if not na(ph)
+        // significant only if leg from last opposite pivot >= pivotMinATR * ATR
+        if na(lastPL) or math.abs(ph - lastPL) >= pivotMinATR * atr
+            sigPH := ph
+        lastPH := ph
+    if not na(pl)
+        if na(lastPH) or math.abs(lastPH - pl) >= pivotMinATR * atr
+            sigPL := pl
+        lastPL := pl
 
 // ----------------------------------------------------------------------------
 //  SELECT THE ACTIVE LEVEL + DIRECTION
@@ -84,26 +183,56 @@ if not na(pl)
 watchRes = dirMode == "Resistance (from below)" or dirMode == "Both"
 watchSup = dirMode == "Support (from above)"    or dirMode == "Both"
 
-// Gather candidate levels (manual + auto) and pick the nearest ABOVE (resistance)
-// and nearest BELOW (support) relative to current price.
-var float lvlRes = na
-var float lvlSup = na
-lvlRes := na
-lvlSup := na
+float lvlRes = na
+float lvlSup = na
 
-// Resistance candidates (above price)
+// Fold every enabled candidate into nearest-above (resistance) / nearest-below
+// (support) slots. Pine functions can't write to globals, so we inline the
+// comparisons via a helper that returns the updated slot value.
+foldRes(cur, v) => (not na(v) and v >= close) ? (na(cur) ? v : math.min(cur, v)) : cur
+foldSup(cur, v) => (not na(v) and v <= close) ? (na(cur) ? v : math.max(cur, v)) : cur
+
 if watchRes
-    if useManual and manualLvl > 0 and manualLvl >= close
-        lvlRes := manualLvl
-    if useAuto and not na(lastPH) and lastPH >= close
-        lvlRes := na(lvlRes) ? lastPH : math.min(lvlRes, lastPH)
+    if useManual and manualLvl > 0
+        lvlRes := foldRes(lvlRes, manualLvl)
+    if usePDHL
+        lvlRes := foldRes(lvlRes, pdh)
+        lvlRes := foldRes(lvlRes, pdl)
+    if useAsia
+        lvlRes := foldRes(lvlRes, asH)
+        lvlRes := foldRes(lvlRes, asL)
+    if useLondon
+        lvlRes := foldRes(lvlRes, loH)
+        lvlRes := foldRes(lvlRes, loL)
+    if useNY
+        lvlRes := foldRes(lvlRes, nyH)
+        lvlRes := foldRes(lvlRes, nyL)
+    if useFVG
+        lvlRes := foldRes(lvlRes, fvgDnMit)
+    if usePivot
+        lvlRes := foldRes(lvlRes, sigPH)
+        lvlRes := foldRes(lvlRes, sigPL)
 
-// Support candidates (below price)
 if watchSup
-    if useManual and manualLvl > 0 and manualLvl <= close
-        lvlSup := manualLvl
-    if useAuto and not na(lastPL) and lastPL <= close
-        lvlSup := na(lvlSup) ? lastPL : math.max(lvlSup, lastPL)
+    if useManual and manualLvl > 0
+        lvlSup := foldSup(lvlSup, manualLvl)
+    if usePDHL
+        lvlSup := foldSup(lvlSup, pdh)
+        lvlSup := foldSup(lvlSup, pdl)
+    if useAsia
+        lvlSup := foldSup(lvlSup, asH)
+        lvlSup := foldSup(lvlSup, asL)
+    if useLondon
+        lvlSup := foldSup(lvlSup, loH)
+        lvlSup := foldSup(lvlSup, loL)
+    if useNY
+        lvlSup := foldSup(lvlSup, nyH)
+        lvlSup := foldSup(lvlSup, nyL)
+    if useFVG
+        lvlSup := foldSup(lvlSup, fvgUpMit)
+    if usePivot
+        lvlSup := foldSup(lvlSup, sigPH)
+        lvlSup := foldSup(lvlSup, sigPL)
 
 // Decide which single level is "active": whichever price is closest to.
 float activeLvl = na
@@ -168,6 +297,23 @@ legacyInRange = not na(activeLvl) and math.abs(close - activeLvl) <= engBand
 inRange   = holdBars > 0 ? not na(engLvl) : legacyInRange
 activeLvl := holdBars > 0 and not na(engLvl) ? engLvl : activeLvl
 activeDir := holdBars > 0 and not na(engLvl) ? engDir : activeDir
+
+// ---- Identify the SOURCE of the active level (for the meter readout) ----
+near(a, b) => not na(a) and not na(b) and math.abs(a - b) <= syminfo.mintick
+srcName = na(activeLvl) ? "—" :
+   near(activeLvl, manualLvl) and useManual and manualLvl > 0 ? "Manual" :
+   near(activeLvl, pdh)      ? "PDH" :
+   near(activeLvl, pdl)      ? "PDL" :
+   near(activeLvl, asH)      ? "Asia High" :
+   near(activeLvl, asL)      ? "Asia Low" :
+   near(activeLvl, loH)      ? "London High" :
+   near(activeLvl, loL)      ? "London Low" :
+   near(activeLvl, nyH)      ? "NY High" :
+   near(activeLvl, nyL)      ? "NY Low" :
+   near(activeLvl, fvgUpMit) ? "FVG mit (bull)" :
+   near(activeLvl, fvgDnMit) ? "FVG mit (bear)" :
+   near(activeLvl, sigPH)    ? "Pivot high" :
+   near(activeLvl, sigPL)    ? "Pivot low" : "Level"
 
 // ----------------------------------------------------------------------------
 //  SCORING  (each factor returns 0..1 where 1 = MORE likely to REJECT)
@@ -272,7 +418,7 @@ f_tblPos() =>
 var table gauge = na
 if showTable and barstate.islast
     if na(gauge)
-        gauge := table.new(f_tblPos(), 2, 6, border_width=1, frame_color=color.gray, frame_width=1)
+        gauge := table.new(f_tblPos(), 2, 7, border_width=1, frame_color=color.gray, frame_width=1)
     scTxt   = na(score) ? "—" : str.tostring(score, "#.0")
     scClr   = na(score) ? color.gray : scoreColor(score)
     dirTxt  = activeDir == 1 ? "Resistance ▲" : activeDir == -1 ? "Support ▼" : "—"
@@ -289,8 +435,10 @@ if showTable and barstate.islast
     table.cell(gauge, 1, 3, dirTxt, text_color=color.white, text_size=size.small)
     table.cell(gauge, 0, 4, "Level", text_color=color.silver, text_size=size.small)
     table.cell(gauge, 1, 4, lvlTxt, text_color=color.white, text_size=size.small)
-    table.cell(gauge, 0, 5, "In range", text_color=color.silver, text_size=size.small)
-    table.cell(gauge, 1, 5, inRange ? "Yes" : "No", text_color=inRange ? color.lime : color.gray, text_size=size.small)
+    table.cell(gauge, 0, 5, "Source", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 5, srcName, text_color=color.white, text_size=size.small)
+    table.cell(gauge, 0, 6, "In range", text_color=color.silver, text_size=size.small)
+    table.cell(gauge, 1, 6, inRange ? "Yes" : "No", text_color=inRange ? color.lime : color.gray, text_size=size.small)
 
 // ----------------------------------------------------------------------------
 //  ALERTS
